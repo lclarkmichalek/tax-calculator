@@ -1,0 +1,1 @@
+DELETE FROM platforms WHERE id = 'vanguard_uk';
