@@ -1,4 +1,9 @@
-use std::{fs::File, io::BufReader, iter::zip, path::Path};
+use std::{
+    collections::HashMap,
+    fs::File,
+    io::{BufReader},
+    path::{PathBuf},
+};
 
 use anyhow::{anyhow, bail, Context, Result};
 use calamine::{open_workbook, Data, DataType, Range, Reader, Xls};
@@ -7,178 +12,187 @@ use diesel::{RunQueryDsl, SelectableHelper, SqliteConnection};
 use log::{debug, warn};
 use regex::Regex;
 
-use crate::models::{Account, Import, Transaction};
+use crate::{
+    importers::manifest::Platform,
+    models::{Account, Import, Transaction},
+};
+
+use super::manifest::Manifest;
 
 type Workbook = Xls<BufReader<File>>;
 
 const DATE_CELL_INDEX: (u32, u32) = (1, 0);
-const DATE_CELL_NAME: &'static str = "A2";
+const DATE_CELL_NAME: &str = "A2";
 const ACCOUNT_NUMBER_CELL_INDEX: (u32, u32) = (3, 0);
-const ACCOUNT_NUMBER_CELL_NAME: &'static str = "A4";
+const ACCOUNT_NUMBER_CELL_NAME: &str = "A4";
 
-pub fn import_transaction_listing(conn: &mut SqliteConnection, path: &Path) -> Result<()> {
-    debug!("opening workbook");
-    let mut workbook = open_workbook::<Workbook, _>(path)?;
+pub(crate) struct Importer {
+    manifest: Manifest,
 
-    debug!("creating import record");
-    let import = create_import(conn, path, &mut workbook)?;
-    debug!("created import metadata: {:?}", import);
+    import_path: PathBuf,
+    workbook: Xls<BufReader<File>>,
 
-    debug!("loading summary");
-    let accounts_and_sheets = create_accounts(conn, &mut workbook, &import)?;
-    debug!("created accounts: {:?}", accounts_and_sheets);
+    sheet_name_by_account_id: HashMap<String, String>,
+}
 
-    debug!("loading transactions");
-    for (account, sheet_name) in &accounts_and_sheets {
-        let worksheet = workbook.worksheet_range(sheet_name)?;
-        let transactions = create_transactions(conn, &worksheet, &import, &account)?;
-        debug!(
-            "loaded {} transactions for {}",
-            transactions.len(),
-            account.id
-        );
+impl Importer {
+    pub(crate) fn new(manifest: Manifest, import_path: PathBuf) -> Result<Importer> {
+        debug!("opening workbook");
+        let workbook = open_workbook::<Workbook, _>(&import_path)?;
+
+        Ok(Importer {
+            manifest,
+            import_path,
+            workbook,
+            sheet_name_by_account_id: HashMap::new(),
+        })
     }
-    Ok(())
-}
 
-fn create_import(
-    conn: &mut SqliteConnection,
-    path: &Path,
-    workbook: &mut Workbook,
-) -> Result<Import> {
-    use crate::schema::imports;
+    pub(crate) fn create_import(&mut self, conn: &mut SqliteConnection) -> Result<Import> {
+        use crate::schema::imports;
 
-    let checksum: String = sha256::try_digest(path)?;
+        let summary_range = self.workbook.worksheet_range("Summary")?;
 
-    let summary_range = workbook.worksheet_range("Summary")?;
+        let generation_date = report_generation_date(&summary_range)?;
+        debug!("report generated at {generation_date:?}");
 
-    let generation_date = report_generation_date(&summary_range)?;
-    debug!("report generated at {generation_date:?}");
+        let new_import = Import {
+            id: self.manifest.sha256sum.clone(),
+            filename: self.import_path.to_str().unwrap().to_owned(),
+            platform_id: Platform::VanguardUK.id().to_owned(),
+            generation_date_unix_timestamp_seconds: generation_date.timestamp(),
+        };
 
-    let new_import = Import {
-        id: checksum,
-        filename: path.to_str().unwrap().to_owned(),
-        platform_id: "vanguard_uk".to_string(),
-        generation_date_unix_timestamp_seconds: generation_date.timestamp(),
-    };
+        let import = diesel::insert_into(imports::table)
+            .values(&new_import)
+            .returning(Import::as_returning())
+            .get_result(conn)?;
+        Ok(import)
+    }
 
-    let import = diesel::insert_into(imports::table)
-        .values(&new_import)
-        .returning(Import::as_returning())
-        .get_result(conn)?;
-    Ok(import)
-}
+    pub(crate) fn create_accounts(
+        &mut self,
+        conn: &mut SqliteConnection,
+        import: &Import,
+    ) -> Result<Vec<Account>> {
+        use crate::schema::accounts;
 
-fn create_accounts(
-    conn: &mut SqliteConnection,
-    workbook: &mut Workbook,
-    import: &Import,
-) -> Result<Vec<(crate::models::Account, String)>> {
-    use crate::schema::accounts;
+        let summary_range = self.workbook.worksheet_range("Summary")?;
 
-    let summary_range = workbook.worksheet_range("Summary")?;
+        let generation_date = report_generation_date(&summary_range)?;
+        debug!("report generated at {generation_date:?}");
 
-    let generation_date = report_generation_date(&summary_range)?;
-    debug!("report generated at {generation_date:?}");
-
-    let account_id_re = Regex::new(r".* \((VG.*)\)")?;
-    let mut accounts = vec![];
-    let mut sheets = vec![];
-    for (sheet_name, worksheet) in workbook.worksheets() {
-        if sheet_name == "Summary" {
-            continue;
-        }
-        // The account ID may be in the sheet name. It may also be in the cell A1. FML
-        let capture = account_id_re.captures(&sheet_name);
-        let account_id = if capture.is_none() {
-            if let Some(account_id) =
-                extract_from_string_cell_single(&worksheet, (0, 0), &account_id_re)?
-            {
-                account_id
-            } else {
-                debug!("no account_id found in {sheet_name:?}");
+        let account_id_re = Regex::new(r".* \((VG.*)\)")?;
+        let mut accounts = vec![];
+        for (sheet_name, worksheet) in self.workbook.worksheets() {
+            if sheet_name == "Summary" {
                 continue;
             }
-        } else {
-            let (_, [account_id]) = capture.unwrap().extract();
-            account_id.to_owned()
-        };
-
-        let new_account = Account {
-            id: account_id.to_string(),
-            platform_id: import.platform_id.clone(),
-            import_id: import.id.clone(),
-        };
-        accounts.push(new_account);
-        sheets.push(sheet_name);
-    }
-
-    diesel::insert_into(accounts::table)
-        .values(&accounts)
-        .execute(conn)?;
-    Ok(zip(accounts, sheets).collect::<Vec<_>>())
-}
-
-/// The per account export sheet is broken up into 2 sections - cash transactions, and then
-/// investment transactions. We are going to scan down the first column until we find a cell
-/// containing "Investment Transactions". The table starts two rows below that.
-fn create_transactions(
-    conn: &mut SqliteConnection,
-    worksheet: &Range<Data>,
-    import: &Import,
-    account: &Account,
-) -> Result<Vec<crate::models::Transaction>> {
-    use crate::schema::transactions;
-
-    // Find the investment transactions table
-    let mut ix = None;
-    for x in 0..1000 {
-        match worksheet.get((x, 0)) {
-            Some(Data::String(val)) => {
-                if val != "Investment Transactions" {
+            // The account ID may be in the sheet name. It may also be in the cell A1. FML
+            let capture = account_id_re.captures(&sheet_name);
+            let account_id = if capture.is_none() {
+                if let Some(account_id) =
+                    extract_from_string_cell_single(&worksheet, (0, 0), &account_id_re)?
+                {
+                    account_id
+                } else {
+                    debug!("no account_id found in {sheet_name:?}");
                     continue;
                 }
-                ix = Some((x, 0));
-                break;
-            }
-            _ => continue,
+            } else {
+                let (_, [account_id]) = capture.unwrap().extract();
+                account_id.to_owned()
+            };
+
+            let new_account = Account {
+                id: account_id.to_string(),
+                platform_id: import.platform_id.clone(),
+                import_id: import.id.clone(),
+            };
+            debug!("associating {} with {}", &new_account.id, sheet_name);
+            self.sheet_name_by_account_id
+                .insert(new_account.id.clone(), sheet_name);
+            accounts.push(new_account);
         }
-    }
-    if ix.is_none() {
-        warn!("could not find investment transactions for {}", account.id);
-        return Ok(vec![]);
-    }
-    let mut ix = ix.unwrap();
-    ix.0 += 3;
-    debug!(
-        "investment transactions for {} start at {:?}",
-        account.id, ix
-    );
 
-    let mut transactions = vec![];
-    // The row before last is a summary row. Exit when the next row is empty
-    while worksheet
-        .get((ix.0 + 1, ix.1))
-        .is_some_and(|x| !DataType::is_empty(x))
-    {
-        let new_transaction = read_row(
-            &worksheet.range((ix.0 as u32, ix.1 as u32), (ix.0 as u32, ix.1 as u32 + 5)),
-            import,
-            account,
-        )
-        .with_context(|| format!("Failed to read transaction from row {:?}", ix))?;
-        let transaction = diesel::insert_into(transactions::table)
-            .values(&new_transaction)
-            .returning(Transaction::as_returning())
-            .get_result(conn)?;
-        transactions.push(transaction);
-        ix.0 += 1;
+        diesel::insert_into(accounts::table)
+            .values(&accounts)
+            .execute(conn)?;
+
+        Ok(accounts)
     }
 
-    Ok(transactions)
+    pub(crate) fn create_transactions(
+        &mut self,
+        conn: &mut SqliteConnection,
+        import: &Import,
+        account: &Account,
+    ) -> Result<Vec<Transaction>> {
+        /// The per account export sheet is broken up into 2 sections - cash transactions, and then
+        /// investment transactions. We are going to scan down the first column until we find a cell
+        /// containing "Investment Transactions". The table starts two rows below that.
+        use crate::schema::transactions;
+
+        let sheet_name = self
+            .sheet_name_by_account_id
+            .get(&account.id)
+            .ok_or(anyhow!(
+                "sheet associated with {} must be present before transactions are created",
+                account.id
+            ))?;
+
+        let worksheet = self.workbook.worksheet_range(sheet_name)?;
+
+        // Find the investment transactions table
+        let mut ix = None;
+        for x in 0..1000 {
+            match worksheet.get((x, 0)) {
+                Some(Data::String(val)) => {
+                    if val != "Investment Transactions" {
+                        continue;
+                    }
+                    ix = Some((x, 0));
+                    break;
+                }
+                _ => continue,
+            }
+        }
+        if ix.is_none() {
+            warn!("could not find investment transactions for {}", account.id);
+            return Ok(vec![]);
+        }
+        let mut ix = ix.unwrap();
+        ix.0 += 3;
+        debug!(
+            "investment transactions for {} start at {:?}",
+            account.id, ix
+        );
+
+        let mut transactions = vec![];
+        // The row before last is a summary row. Exit when the next row is empty
+        while worksheet
+            .get((ix.0 + 1, ix.1))
+            .is_some_and(|x| !DataType::is_empty(x))
+        {
+            let new_transaction = read_transaction_row(
+                &worksheet.range((ix.0 as u32, ix.1 as u32), (ix.0 as u32, ix.1 as u32 + 5)),
+                import,
+                account,
+            )
+            .with_context(|| format!("Failed to read transaction from row {:?}", ix))?;
+            let transaction = diesel::insert_into(transactions::table)
+                .values(&new_transaction)
+                .returning(Transaction::as_returning())
+                .get_result(conn)?;
+            transactions.push(transaction);
+            ix.0 += 1;
+        }
+
+        Ok(transactions)
+    }
 }
 
-fn read_row(
+fn read_transaction_row(
     row: &Range<Data>,
     import: &Import,
     account: &Account,
@@ -277,8 +291,8 @@ fn extract_from_string_cell_single(
     re: &Regex,
 ) -> Result<Option<String>> {
     if let Some([x]) = extract_from_string_cell(tab, index, re)? {
-        return Ok(Some(x));
+        Ok(Some(x))
     } else {
-        return Ok(None);
+        Ok(None)
     }
 }
