@@ -18,6 +18,8 @@ CREATE TABLE accounts (
     id TEXT PRIMARY KEY NOT NULL,
     platform_id TEXT NOT NULL,
     import_id TEXT NOT NULL,
+    label TEXT,
+    kind TEXT,
     FOREIGN KEY(platform_id) REFERENCES platforms(id) ON DELETE CASCADE
     FOREIGN KEY(import_id) REFERENCES imports(id) ON DELETE CASCADE
 );

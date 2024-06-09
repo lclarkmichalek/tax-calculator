@@ -1,9 +1,4 @@
-use std::{
-    collections::HashMap,
-    fs::File,
-    io::{BufReader},
-    path::{PathBuf},
-};
+use std::{collections::HashMap, fs::File, io::BufReader, path::PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 use calamine::{open_workbook, Data, DataType, Range, Reader, Xls};
@@ -104,11 +99,14 @@ impl Importer {
                 account_id.to_owned()
             };
 
-            let new_account = Account {
+            let mut new_account = Account {
                 id: account_id.to_string(),
                 platform_id: import.platform_id.clone(),
                 import_id: import.id.clone(),
+                label: None,
+                kind: None,
             };
+            self.manifest.apply_account_metadata(&mut new_account);
             debug!("associating {} with {}", &new_account.id, sheet_name);
             self.sheet_name_by_account_id
                 .insert(new_account.id.clone(), sheet_name);

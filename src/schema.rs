@@ -5,6 +5,8 @@ diesel::table! {
         id -> Text,
         platform_id -> Text,
         import_id -> Text,
+        label -> Nullable<Text>,
+        kind -> Nullable<Text>,
     }
 }
 

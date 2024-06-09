@@ -1,5 +1,7 @@
 use diesel::prelude::*;
 
+use crate::importers::manifest::AccountKind;
+
 #[derive(Queryable, Selectable, Debug, Insertable)]
 #[diesel(table_name = crate::schema::imports)]
 #[diesel(check_for_backend(diesel::sqlite::Sqlite))]
@@ -13,10 +15,12 @@ pub struct Import {
 #[derive(Queryable, Selectable, Debug, Insertable)]
 #[diesel(table_name = crate::schema::accounts)]
 #[diesel(check_for_backend(diesel::sqlite::Sqlite))]
-pub struct Account {
-    pub id: String,
-    pub platform_id: String,
-    pub import_id: String,
+pub(crate) struct Account {
+    pub(crate) id: String,
+    pub(crate) platform_id: String,
+    pub(crate) import_id: String,
+    pub(crate) label: Option<String>,
+    pub(crate) kind: Option<AccountKind>,
 }
 
 #[derive(Queryable, Selectable, Debug, Insertable)]
